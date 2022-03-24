@@ -6,14 +6,14 @@ import random
 from tensorflow.keras import layers
 
 ################################################ Appearance Transformations ###################################
-class Indentity(tf.keras.Model):
+class Identity(tf.keras.Model):
     def __init__(self):
         super().__init__()
 
     def call(self, x):
         return x
 
-class GaussainBlur(tf.keras.Model):
+class GaussianBlur(tf.keras.Model):
     def __init__(self, n_channels=1, kernel_size=7):
         super().__init__()
         self.padding = kernel_size//2
@@ -21,7 +21,7 @@ class GaussainBlur(tf.keras.Model):
         self.base_gauss = tf.constant(self.get_gaussian_kernel2d(kernel_size, n_channels), dtype=tf.float32)
 
         # learnable parameter
-        self.sigma = tf.Variable(1.0, dtype=tf.float32)
+        self.sigma = tf.Variable(1.0, dtype=tf.float32, name="sigma_gaussian")
 
     def gaussain_window(self, window_size):
         def gauss_fcn(x):
@@ -46,7 +46,7 @@ class GaussainBlur(tf.keras.Model):
 
     def __call__(self, x):
         gauss_kernel = tf.pow(self.base_gauss, 1.0/tf.square(self.sigma))
-        gauss_kernel = gauss_kernel / gauss_kernel.sum() # lucky to have only one channel image, otherwise divide channel wise sum
+        gauss_kernel = gauss_kernel / tf.reduce_sum(gauss_kernel)  # lucky to have only one channel image, otherwise divide channel wise sum
         x = tf.pad(x,
                   tf.constant([[0,                       0],
                                [self.padding, self.padding],
@@ -59,10 +59,10 @@ class GaussainBlur(tf.keras.Model):
 
 
 class CommonStyle(tf.keras.Model):
-    def __init__(self, n_channels=1):
+    def __init__(self, n_channels=1, name=None):
         super().__init__()
-        self.bias = tf.Variable(np.zeros((1, 1, 1, n_channels)), dtype=tf.float32)
-        self.range = tf.Variable(1e-3 * np.ones(1, 1, 1, n_channels), dtype=tf.float32)
+        self.bias = tf.Variable(np.zeros((1, 1, 1, n_channels)), dtype=tf.float32, name=name+"_bias")
+        self.range = tf.Variable(1e-3 * np.ones((1, 1, 1, n_channels)), dtype=tf.float32, name=name+"_range")
         
         self.n_channels = n_channels
 
@@ -80,7 +80,7 @@ class CommonStyle(tf.keras.Model):
 
 class Brightness(CommonStyle):
     def __init__(self, n_channels=1):
-        super().__init__(n_channels=n_channels)
+        super().__init__(n_channels, "brightness")
     
     def __call__(self, x):
         size = tf.stack([tf.shape(x)[0], 1, 1, self.n_channels])
@@ -95,7 +95,7 @@ class Brightness(CommonStyle):
 
 class Contrast(CommonStyle):
     def __init__(self, n_channels=1):
-        super().__init__(n_channels=n_channels)
+        super().__init__(n_channels, "contrast")
 
     def __call__(self, x):
         size = tf.stack([tf.shape(x)[0], 1, 1, self.n_channels])
@@ -110,13 +110,16 @@ class Contrast(CommonStyle):
 
 class Gamma(CommonStyle):
     def __init__(self, n_channels=1):
-        super().__init__(n_channels=1)
+        super().__init__(n_channels, "gamma")
 
     def __call__(self, x):
         size = tf.stack([tf.shape(x)[0], 1, 1, self.n_channels])
         x = self.denormalize(x)
 
         random_gamma = 1.0 + self.bias + 1e-2 * self.abs(self.range) * self.uniform_dist(size)
+        x = x ** (random_gamma)
+        x = self.normalize(x)
+        return x
 
 
 ################################################ Spatial Transformations ############################################
@@ -331,14 +334,14 @@ class RandomSpatial(tf.keras.Model):
                                    [0, 1],
                                    [0, 0]]), mode="CONSTANT")
         # H is now batch, 3, 3, but all values are zero
-        H[..., -1, -1] += 1.0 # add 1 to the last row and last column
+        H = H + tf.constant( [[0, 0, 0], [0, 0, 0], [0, 0, 1]] , dtype=tf.float32) # add 1 to the last row and last column
 
         return H
 
     def invert_affine(self, affine):
         homo_affine = self.get_homographic_mat(affine)
         inv_homo_affine = tf.linalg.inv(homo_affine)
-        inv_affine = inv_affine[:, :2, :3]
+        inv_affine = inv_homo_affine[:, :2, :3]
 
         return inv_affine
 
@@ -351,8 +354,8 @@ class RandomResizeCrop(RandomSpatial):
         super().__init__()
 
     def register_custom_parameters(self):
-        self.delta_scale_x = tf.Variable(0.1, dtype=tf.float32)
-        self.delta_scale_y = tf.Variable(0.1, dtype=tf.float32)
+        self.delta_scale_x = tf.Variable(0.1, dtype=tf.float32, name="random_resize_crop_delta_x")
+        self.delta_scale_y = tf.Variable(0.1, dtype=tf.float32, name="random_resize_crop_delta_y")
 
         self.scale_matrix_x = tf.constant(np.array([1, 0, 0, 0, 0, 0]).reshape(-1, 2, 3), dtype=tf.float32)
         self.scale_matrix_y = tf.constant(np.array([0, 0, 0, 0, 1, 0]).reshape(-1, 2, 3), dtype=tf.float32)
@@ -380,11 +383,15 @@ class RandomHorizontalFlip(RandomSpatial):
         self.horizontal_flip = tf.constant(np.array([-1, 0, 0, 0, 1, 0]).reshape(-1, 2, 3), dtype=tf.float32)
 
     def generate_random_affine(self, batch_size):
-        affine = tf.tile(self.unit_affine, tf.stack([batch_size, 1, 1]))
-
         # randomly flip some of the images in the batch
-        mask = tf.random.uniform(batch_size) > 0.5
-        affine[mask] = affine[mask] * self.horizontal_flip
+        mask = tf.random.uniform([batch_size]) > 0.5
+        ids_true = tf.cast(tf.where(mask), tf.int32)
+        ids_false = tf.cast(tf.where(tf.logical_not(mask)), tf.int32)
+
+        affine_true = tf.scatter_nd(ids_true, tf.tile(self.unit_affine, tf.stack([tf.shape(ids_true)[0], 1, 1])), tf.stack([batch_size, 2, 3]))
+        affine_false = tf.scatter_nd(ids_false, tf.tile(self.horizontal_flip, tf.stack([tf.shape(ids_false)[0], 1, 1])), tf.stack([batch_size, 2, 3]))
+        
+        affine = affine_true + affine_false
 
         return affine
 
@@ -397,11 +404,15 @@ class RandomVerticalFlip(RandomSpatial):
         self.horizontal_flip = tf.constant(np.array([1, 0, 0, 0, -1, 0]).reshape(-1, 2, 3), dtype=tf.float32)
 
     def generate_random_affine(self, batch_size):
-        affine = tf.tile(self.unit_affine, tf.stack([batch_size, 1, 1]))
-
         # randomly flip some of the images in the batch
-        mask = tf.random.uniform(batch_size) > 0.5
-        affine[mask] = affine[mask] * self.horizontal_flip
+        mask = tf.random.uniform([batch_size]) > 0.5
+        ids_true = tf.cast(tf.where(mask), tf.int32)
+        ids_false = tf.cast(tf.where(tf.logical_not(mask)), tf.int32)
+
+        affine_true = tf.scatter_nd(ids_true, tf.tile(self.unit_affine, tf.stack([tf.shape(ids_true)[0], 1, 1])), tf.stack([batch_size, 2, 3]))
+        affine_false = tf.scatter_nd(ids_false, tf.tile(self.horizontal_flip, tf.stack([tf.shape(ids_false)[0], 1, 1])), tf.stack([batch_size, 2, 3]))
+        
+        affine = affine_true + affine_false
 
         return affine
 
@@ -414,11 +425,15 @@ class RandomRotate(RandomSpatial):
         self.horizontal_flip = tf.constant(np.array([0, -1, 0, 1, 0, 0]).reshape(-1, 2, 3), dtype=tf.float32)
 
     def generate_random_affine(self, batch_size):
-        affine = tf.tile(self.unit_affine, tf.stack([batch_size, 1, 1]))
+        mask = tf.random.uniform([batch_size]) > 0.5
+        ids_true = tf.cast(tf.where(mask), tf.int32)
+        ids_false = tf.cast(tf.where(tf.logical_not(mask)), tf.int32)
 
-        # randomly flip some of the images in the batch
-        mask = tf.random.uniform(batch_size) > 0.5
-        affine[mask] = affine[mask] * self.horizontal_flip
+        affine_true = tf.scatter_nd(ids_true, tf.tile(self.unit_affine, tf.stack([tf.shape(ids_true)[0], 1, 1])), tf.stack([batch_size, 2, 3]))
+        affine_false = tf.scatter_nd(ids_false, tf.tile(self.horizontal_flip, tf.stack([tf.shape(ids_false)[0], 1, 1])), tf.stack([batch_size, 2, 3]))
+        
+        affine = affine_true + affine_false
+
 
         return affine
 

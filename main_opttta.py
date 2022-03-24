@@ -1,4 +1,5 @@
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
 
 from trainers_policy.opttta import OptTTA
 import argparse
@@ -39,6 +40,8 @@ if __name__ == '__main__':
     parser.add_argument("--k", default=128, type=int)
 
     opt = parser.parse_args()
+
+    opt.target_sites = opt.target_sites.split(",")
 
     ensure_dirs(opt.checkpoints_opttta)
     trainer = OptTTA(opt)

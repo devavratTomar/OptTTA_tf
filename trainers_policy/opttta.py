@@ -15,16 +15,16 @@ from utils import MetricTracker
 from utils import *
 from PIL import Image
 
-from trainers_policy.diff_augmentations import Indentity, GaussainBlur, Contrast, Brightness, Gamma, RandomResizeCrop, RandomHorizontalFlip,\
+from trainers_policy.diff_augmentations import Identity, GaussianBlur, Contrast, Brightness, Gamma, RandomResizeCrop, RandomHorizontalFlip,\
     RandomVerticalFlip, RandomRotate, DummyAugmentor
 
 DEBUG = True
-STYLE_AUGMENTORS = [Gamma.__name__, GaussainBlur.__name__, Contrast.__name__, Brightness.__name__, Indentity.__name__]
-SPATIAL_AUGMENTORS = [RandomResizeCrop.__name__, RandomHorizontalFlip.__name__, RandomVerticalFlip.__name__, RandomRotate.__name__, RandomScaledCenterCrop.__name__]
+STYLE_AUGMENTORS = [Gamma.__name__, GaussianBlur.__name__, Contrast.__name__, Brightness.__name__, Identity.__name__]
+SPATIAL_AUGMENTORS = [RandomResizeCrop.__name__, RandomHorizontalFlip.__name__, RandomVerticalFlip.__name__, RandomRotate.__name__]
 
 STRING_TO_CLASS = {
-    'Identity': Indentity,
-    'GaussianBlur': GaussainBlur,
+    'Identity': Identity,
+    'GaussianBlur': GaussianBlur,
     'Contrast': Contrast,
     'Brightness': Brightness,
     'Gamma': Gamma,
@@ -66,7 +66,7 @@ class OptTTA():
         # save augmentors
         for aug in augmentors:
             aug_name = type(aug).__name__
-            aug.save_weights(os.path.join(save_dir, aug_name))
+            aug.save_weights(os.path.join(save_dir, aug_name, aug_name))
 
     def load_policy(self, policy_name, augmentors):
         save_dir = os.path.join(self.opt.checkpoints_opttta, 'saved_policies', policy_name)
@@ -74,7 +74,9 @@ class OptTTA():
         # get augmentors
         for aug in augmentors:
             aug_name = type(aug).__name__
-            aug.load_weights(os.path.join(save_dir, aug_name))
+            # load only if there are trainable parameters
+            if aug_name not in ["RandomHorizontalFlip", "RandomVerticalFlip", "RandomRotate", "Identity"]:
+                aug.load_weights(os.path.join(save_dir, aug_name, aug_name))
 
 
     def get_batch_norm_stats(self):
@@ -83,8 +85,9 @@ class OptTTA():
 
     def get_slice_index(self, img, threshold):
         out = []
-        for i in range(img.size()[0]):
-            tmp_img = img[i].clone() # don't spoil input image
+        # print(img.shape)
+        for i in range(img.shape[0]):
+            tmp_img = img[i].copy() # don't spoil input image
             min_val = np.quantile(tmp_img, 0.1)
             max_val = np.quantile(tmp_img, 0.9)
             tmp_img[tmp_img<min_val] = min_val
@@ -98,7 +101,6 @@ class OptTTA():
 
 
     def ensemble_predictions(self, augmentors, tgt_vol, batch_size=16):
-    
         k = self.opt.k
         # self.unet.train()
         style_augmentors = [aug for aug in augmentors if type(aug).__name__ in STYLE_AUGMENTORS]
@@ -109,10 +111,10 @@ class OptTTA():
         viz_preds = []
         viz_augs = []
 
-        for i in range(tgt_vol.size()[0]):
+        for i in range(tgt_vol.shape[0]):
             predictions = []
             for j in range(0, k//batch_size):
-                aug_imgs = tgt_vol[i:(i+1)].repeat(batch_size, 1, 1, 1)
+                aug_imgs = np.tile(tgt_vol[i:(i+1)], (batch_size, 1, 1, 1))
 
                 spatial_affines = []
                 for aug in style_augmentors:
@@ -135,7 +137,7 @@ class OptTTA():
                     inv_affine = aug.invert_affine(affine)
                     preds, inv_affine = aug.test(preds, inv_affine)
                 
-                predictions.append(preds.numpy())
+                predictions.append(preds)
 
                 ## end for j loop
             
@@ -151,8 +153,8 @@ class OptTTA():
         predictions_volume = np.stack(predictions_volume, axis=0)
 
         # visualizations
-        viz_augs = np.stack(viz_augs, axis=0)
-        viz_preds = np.stack(viz_preds, axis=0)
+        viz_augs = np.concatenate(viz_augs, axis=0)
+        viz_preds = np.concatenate(viz_preds, axis=0)
         
         return predictions_volume, viz_preds, viz_augs
 
@@ -169,16 +171,17 @@ class OptTTA():
             tmp = []
             for j in range(0, target_image.shape[0], sample_size):
                 batch_imgs = target_image[j:(j+sample_size)].copy()
-                batch_imgs = tf.image.resize(batch_imgs, [256, 256], ResizeMethod.BILINEAR)
+                # batch_imgs = tf.image.resize(batch_imgs, [256, 256], ResizeMethod.BILINEAR)
                 pred = self.unet(batch_imgs, training=False).numpy()
                 pred = np.argmax(pred, axis=-1)
                 tmp.append(pred)
             
             pred = np.concatenate(tmp, axis=0)
             pred_visuals.append(pred)
-            aug_visuals.append(batch_imgs.numpy())
+            aug_visuals.append(target_image)
         
         slice_indices = self.get_slice_index(target_image, 0.2)
+        # print(slice_indices)
         optimizer = tfa.optimizers.AdamW(weight_decay=1e-4, learning_rate=0.002, beta_1=0.9, beta_2=0.999, epsilon=1e-08)
 
         for iter_step in tqdm.tqdm(range(n_steps)):
@@ -202,25 +205,30 @@ class OptTTA():
                 loss_entropy = tf.reduce_mean(tf.reduce_sum(-p * tf.math.log(p + 1e-6), axis=-1)) * 100
 
                 ### nuclear norm
-                p_reduce = self.max_pool(p)
+                p_reduce = self.max_pool(p) # shape is b x h x w x
                 shape = [tf.shape(p_reduce)[0], tf.shape(p_reduce)[1] * tf.shape(p_reduce)[2], tf.shape(p_reduce)[3]]
                 p_reduce = tf.reshape(p_reduce, shape=shape)
-                loss_nuclear = tf.reduce_mean(tf.reduce_sum(tf.linalg.svd(p_reduce, compute_uv=False), axis=-1)) * 0.5
+                loss_nuclear = -tf.reduce_mean(tf.reduce_sum(tf.linalg.svd(p_reduce, compute_uv=False), axis=-1)) * 0.5
 
                 ###
-                loss = loss_batch_norm + loss_entropy - loss_nuclear
+                loss = loss_batch_norm + loss_entropy + loss_nuclear
             
             ## extract gradients
-            gradients = tape.gradient(loss, [augment.trainable_variables for augment in augmentors_list])
+            trainable_variables = []
+            for augment in augmentors_list:
+                trainable_variables += augment.trainable_variables
+            
+            gradients = tape.gradient(loss, trainable_variables)
             ## clip the gradients
             gradients = [tf.clip_by_norm(grad, 1.0) for grad in gradients]
-            optimizer.apply_gradients(zip(gradients, [augment.trainable_variables for augment in augmentors_list]))
+            
+            optimizer.apply_gradients(zip(gradients, trainable_variables))
 
             self.metric_tracker.update_metrics({
-                'total': loss.numpy(),
-                'bn': loss_batch_norm.numpy(),
                 'ent': loss_entropy.numpy(),
-                'div': loss_nuclear.numpy()
+                'bn': loss_batch_norm.numpy(),
+                'div': loss_nuclear.numpy(),
+                'total': loss.numpy(),
             })
 
             loss_curve.append(list(self.metric_tracker.current_metrics().values()))
@@ -236,7 +244,7 @@ class OptTTA():
         return loss_curve
 
 
-    def test_time_optimize(self, target_image, target_image_name, batch_size=12, best_k_policies=3):
+    def test_time_optimize(self, target_image, target_image_name, batch_size=8, best_k_policies=3):
         n_augs = self.opt.n_augs
         sub_policies = []
 
@@ -259,7 +267,7 @@ class OptTTA():
 
         else:
             print('\n\nNo Optimized Sub policies exists. Performing exploration........\n\n')
-            all_augmentations = [Gamma, GaussainBlur, Contrast, Brightness, Indentity, RandomResizeCrop, DummyAugmentor]
+            all_augmentations = [Gamma, GaussianBlur, Contrast, Brightness, Identity, RandomResizeCrop, DummyAugmentor]
             for item in itertools.combinations(all_augmentations, n_augs):
                 item = list(item)
                 if DummyAugmentor in item:
@@ -273,7 +281,6 @@ class OptTTA():
         print('\n\n')
 
         optimized_subpolicies = []
-        subpolicies_optimizers_state_dicts = []
         global_policy_losses = []
 
         for sub_policy in sub_policies:
@@ -304,12 +311,11 @@ class OptTTA():
                 self.visualize_segmentations(aug_visuals, pred_visuals, policy_name, target_image_name)
                 self.visualize_losses(loss_curve, policy_name, target_image_name)
 
-            
+            optimized_subpolicies.append(augmentations)
             global_policy_losses.append(loss_curve[-1][-1])
 
         best_policy_indices = np.argsort(global_policy_losses)[:best_k_policies]
         all_sub_policy_mean_predictions = {}
-        all_sub_policy_uncertainty_estimation = {}
         all_sub_policy_viz_aug = {}
         all_sub_policy_viz_pred = {}
 
@@ -320,21 +326,19 @@ class OptTTA():
             print('Loss for policy %s %f'% (policy_name, global_policy_losses[i]))
             names_opt_sub_polices.append(policy_name)
 
-            mean_pred, uncertainty_pred, viz_preds, viz_augs = self.ensemble_predictions(optimized_subpolicies[i], target_image)
+            mean_pred, viz_preds, viz_augs = self.ensemble_predictions(optimized_subpolicies[i], target_image)
             all_sub_policy_mean_predictions[policy_name] = mean_pred
-            all_sub_policy_uncertainty_estimation[policy_name] = uncertainty_pred
 
             ## visualizations
             all_sub_policy_viz_aug[policy_name] = viz_augs
             all_sub_policy_viz_pred[policy_name] = viz_preds
 
             ## save policies if needed
-            self.save_optimizer(policy_name, subpolicies_optimizers_state_dicts[i])
             self.save_policy(policy_name, optimized_subpolicies[i])
 
         # take average across all subpolicies
         final_prediction = np.stack(list(all_sub_policy_mean_predictions.values()), axis=0)
-        final_prediction = np.mean(final_prediction, axis=-1, keepdim=False)
+        final_prediction = np.mean(final_prediction, axis=0)
         final_prediction_labels = np.argmax(final_prediction, axis=-1)
 
         # save opt subpolicy names
@@ -369,10 +373,10 @@ class OptTTA():
 
         ncol = int(math.ceil(batch/nrow))
 
-        if x.dim==3:
-            out_array = np.zeros((ncol * h, nrow * w))
+        if x.ndim==3:
+            out_array = np.zeros((ncol * h, nrow * w), dtype=x.dtype)
         else:
-            out_array = np.zeros((ncol * h, nrow * w, ch))
+            out_array = np.zeros((ncol * h, nrow * w, ch), dtype=x.dtype)
         
         for i in range(batch):
             col_num = i % nrow
@@ -388,13 +392,14 @@ class OptTTA():
 
 
     def visualize_segmentations(self, imgs, segs, policy_name, img_name):
+        # print(imgs.shape, segs.shape)
         img_grid = self.make_grid(imgs, nrow=4)
         seg_grid = self.make_grid(segs, nrow=4)
         overlay_grid = overlay_segs(img_grid, seg_grid)
 
         ensure_path(os.path.join(self.opt.checkpoints_opttta, 'visuals', 'segmentations', policy_name))
         self.save_image(overlay_grid, os.path.join(self.opt.checkpoints_opttta, 'visuals', 'segmentations', policy_name, img_name + '.png'))
-        self.save_image(0.5*img_grid + 0.5, os.path.join(self.opt.checkpoints_opttta, 'visuals', 'segmentations', policy_name, img_name + '_img_' + '.png'))
+        self.save_image(0.5*np.clip(np.tile(img_grid, (1, 1, 3)), -1, 1) + 0.5, os.path.join(self.opt.checkpoints_opttta, 'visuals', 'segmentations', policy_name, img_name + '_img_' + '.png'))
     
     def save_pred_numpy(self, x, folder, name):
         ensure_path(os.path.join(self.opt.checkpoints_opttta, folder))
@@ -408,10 +413,22 @@ class OptTTA():
         for iter, (img, seg) in enumerate(self.target_test_dataloader):
             patient_name = self.target_test_dataloader.patient_names[iter]
             
-            print('Predicting for image: ', patient_name)
-            pred, pred_probs, all_sub_policy_mean_predictions, all_sub_policy_aug_imgs = self.test_time_optimize(img)
+            # print('Predicting for image: ', patient_name)
+            pred, pred_probs, all_sub_policy_mean_predictions, all_sub_policy_aug_imgs = self.test_time_optimize(img, patient_name)
+            # print("shape pred, pred_prob img ")
+            # print(pred.shape, pred_probs.shape, img.shape)
 
-            viz = self.make_grid(viz, nrow=len(img))
-            self.save_image(viz, os.path.join(self.opt.checkpoints_source_free_da, 'visuals', 'final_predictions', patient_name + '.png'))
+            grid_pred = self.make_grid(pred, nrow=len(img))
+            grid_imgs = self.make_grid(img,  nrow=len(img))
+            grid_segs = self.make_grid(seg,  nrow=len(img))
+
+            grid_segs = overlay_segs(grid_imgs, grid_segs)
+            grid_pred = overlay_segs(grid_imgs, grid_pred)
+            grid_imgs = 0.5*np.tile(grid_imgs, (1, 1, 3)) + 0.5
+
+            viz = np.concatenate([grid_imgs, grid_segs, grid_pred], axis=0)
+
+            self.save_image(viz, os.path.join(self.opt.checkpoints_opttta, 'visuals', 'final_predictions', patient_name + '.png'))
+            
             self.save_pred_numpy(pred, 'predictions', patient_name)
             self.save_pred_numpy(pred_probs, 'predictions_prob', patient_name)

@@ -1,6 +1,8 @@
 import numpy as np
 import albumentations as A
 
+from scipy.ndimage import zoom
+
 from utils import natural_sort
 from .utils import *
 import os
@@ -72,11 +74,16 @@ class GenericNumpyVolumeLoader:
         patients_segs    = []
 
         for p in patients:
-            slices = [np.load(os.path.join(self.rootdir, f)) for f in imgs_paths if p in f]
-            segs   = [np.load(os.path.join(self.rootdir, f)) for f in seg_paths if p in f]
+            slices = [np.load(os.path.join(self.rootdir, f)).astype(np.float32) for f in imgs_paths if p in f]
+            segs   = [np.load(os.path.join(self.rootdir, f)).astype(np.int32) for f in seg_paths if p in f]
 
             slices = np.stack(slices, axis=0)
             segs   = np.stack(segs, axis=0)
+
+            # shape to 256 256
+            h, w = slices.shape[1:]
+            slices = zoom(slices, (1, 256/h, 256/w), order=2)
+            segs   = zoom(segs, (1, 256/h, 256/w), order=0 )
 
             slices = slices[..., np.newaxis] # batch h w ch
             slices = 2 * slices - 1          # normalize to -1 and 1
@@ -88,7 +95,7 @@ class GenericNumpyVolumeLoader:
         self.patients_segs    = patients_segs
         self.patient_names = patients
 
-    def fetch(self, index):
+    def __getitem__(self, index):
         return self.patients_volumes[index], self.patients_segs[index]
 
     def __len__(self):

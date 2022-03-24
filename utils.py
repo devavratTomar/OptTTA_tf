@@ -26,7 +26,7 @@ def natural_keys(text):
 def natural_sort(items):
     new_items = items.copy()
     new_items.sort(key=natural_keys)
-    return 
+    return new_items
 
 class MetricTracker:
     def __init__(self):
@@ -52,13 +52,12 @@ def overlay_segs(img, seg, alpha=0.2):
     imgs should be in range [-1, 1] and shape  H x W x C
     seg should have integer range with same spatial shape as H x W.
     """
-
-    assert img.size()[:2] == seg.size()[:2]
-    mask = (seg != 0)
+    print(img.shape, seg.shape)
+    assert img.shape[:2] == seg.shape[:2]
+    mask = (seg != 0)[..., np.newaxis]
 
     color_seg = COLORS[seg]/255.0
-    img = img.clamp(-1, 1) * 0.5 + 0.5
-    img = img
+    img = np.clip(img, -1, 1) * 0.5 + 0.5
     
     merged = mask*(alpha*color_seg + (1-alpha)*img) + (~mask) * img
 
